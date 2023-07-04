@@ -121,13 +121,10 @@
 
 (defun cvau (lexenv args)
   (declare (ignore lexenv))
-  (let ((reg-symbols (make-hash-table))
-        (fenv (car args))
-        (farg (cadr args))
-        (body (cddr args)))
+  (let ((reg-symbols (make-hash-table)))
     (setf (gethash 0 reg-symbols) '%self
-          (gethash 1 reg-symbols) fenv
-          (gethash 2 reg-symbols) farg)
+          (gethash 1 reg-symbols) '%env
+          (gethash 2 reg-symbols) '%args)
     (labels ((reg-symbol (n)
                (or (gethash n reg-symbols)
                    (setf (gethash n reg-symbols) (make-symbol (format nil "R~A" n)))))
@@ -137,9 +134,7 @@
                           (let ((dest (cadr form))
                                 (rest (cddr form)))
                             `(,(reg-symbol dest)
-                              ,(ecase (car form)
-                                 ((ins)
-                                  `(,(car rest) ,@(mapcar #'reg-symbol (cdr rest))))
+                              ,(case (car form)
                                  ((lit)
                                   `',(car rest))
                                  ((branch)
@@ -148,7 +143,9 @@
                                         (else (caddr rest)))
                                     `(if ,(reg-symbol test)
                                          ,(process-begin then)
-                                         ,(process-begin else))))))))
+                                         ,(process-begin else))))
+                                 (t
+                                  `(,(car form) ,@(mapcar #'reg-symbol rest)))))))
                         (butlast body))
                   ,(let ((form (car (last body))))
                      (ecase (car form)
@@ -157,7 +154,11 @@
                (ecase (car form)
                  ((begin) (process (cdr form))))))
       (vecenv <closure>
-              (list (list 'code (compile nil `(lambda (%self ,fenv ,farg) ,(process body)))))))))
+              (list (list 'code (compile nil `(lambda (%self %env %args) ,(process args)))))))))
+
+(defun install-code! (vau cvau)
+  (setf (value vau 0) (value cvau 0))
+  t)
 
 (defun make-primop (f)
   (let ((lambda-name (intern (format nil "%~A" (symbol-name f)))))
@@ -178,19 +179,19 @@
                                            #',lambda-name)))
                    (list 'name f))))))
 
-(defun fexpr-if (env args)
+(defun %if (env args)
   (if (eval env (car args))
       (eval env (cadr args))
       (eval env (caddr args))))
 
-(defun fexpr-time (env args)
+(defun %time (env args)
   (time (eval env (car args))))
 
-(defun fexpr-parent (x) (parent x))
+(defun %parent (x) (parent x))
 
 (defvar *inspecting-object* nil)
 
-(defun fexpr-inspect (x) (setq *inspecting-object* x))
+(defun %inspect (x) (setq *inspecting-object* x))
 
 (defun boot ()
   (let ((env
@@ -199,21 +200,22 @@
                         #+nil (ins ,#'ins) #+nil (lit ,#'lit)
                         (<closure> ,<closure>)
                         (<primitive> ,<primitive>)
-                        (if ,(make-primop 'fexpr-if))
+                        (if ,(make-primop '%if))
                         (eq? ,(make-primapp 'equal))
                         ,@ (mapcar (lambda (symbol) `(,symbol ,(make-primapp symbol)))
                                    '(eval combine define! mutate!
                                      tag cons car cdr wrap unwrap > = < + - * /
-                                     vecenv hashenv print break lookup bound? error))
-                        (parent ,(make-primapp 'fexpr-parent))
-                        (time ,(make-primop 'fexpr-time))
-                        (inspect ,(make-primapp 'fexpr-inspect))
+                                     vecenv hashenv print break lookup bound? error
+                                     install-code!))
+                        (parent ,(make-primapp '%parent))
+                        (time ,(make-primop '%time))
+                        (inspect ,(make-primapp '%inspect))
                         (nil nil)
                         (t t))))
         (*print-circle* t))
-    (dolist (form (uiop:read-file-forms "boot.k"))
-      (when (equal form '(**break**)) (return))
-      (eval env form))
+    (time (dolist (form (uiop:read-file-forms "boot.k"))
+       (when (equal form '(**break**)) (return))
+       (eval env form)))
     (handler-case
         (loop
           (format t "~&PK> ")

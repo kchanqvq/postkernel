@@ -58,8 +58,9 @@
 
 (define map
     (lambda (f a-list)
-      (foldr (lambda (kar kdr) (cons (f kar) kdr))
-             nil a-list)))
+      (reverse
+       (foldl (lambda (rest el) (cons (f el) rest))
+              nil a-list))))
 
 (define begin2
     (vau1 env (first second)
@@ -229,22 +230,25 @@
           (lambda (ins)
             (define class (car ins))
             (define body (cddr ins))
-            (cond ((eq? class 'ins) (map (lambda (reg) (define! mark-table reg t)) (cdr body)))
+            (cond ((eq? class 'lit))
                   ((eq? class 'branch)
                    (define! mark-table (car body) t)
                    (map mark-ins (cdr (cadr body)))
-                   (map mark-ins (cdr (caddr body)))))))
+                   (map mark-ins (cdr (caddr body))))
+                  (t (map (lambda (reg) (define! mark-table reg t)) body)))))
       (define result (list (list 'reg root-reg)))
       (define process
           (lambda (code-list)
             (when code-list
               (define ins (car code-list))
-              (when (bound? mark-table (cadr ins))
+              (when (or (eq? (car ins) 'combine)
+                        (eq? (car ins) 'define!)
+                        (eq? (car ins) 'mutate!)
+                        (bound? mark-table (cadr ins)))
                 (mark-ins ins)
                 (push! result ins))
               (process (cdr code-list)))))
       (process code-list)
-      (print mark-table)
       result))
 
 (define! <primitive> 'residualize
@@ -334,8 +338,7 @@
               (vecenv <code> (list (list 'reg reg))))
              (test (peval env then))
              (t (peval env else)))))
-;; TODO: residualize vau creation; call compile recursively
-(define! vau0 'compile expand-when-static)
+
 (define! begin2 'compile
   (vau env (_ first second)
        (peval env first)
@@ -357,6 +360,14 @@
        (define reg (reify env))
        (emit-ins! 'define! (vecenv <code> (list (list 'reg reg))) key value)
        (define! (lookup env-store reg) key value)))
+;; TODO: call compile recursively
+(define! vau0 'compile
+  (vau env (_ . args)
+       (define env-reg (reify env))
+       (define code (emit-ins! 'vau (vecenv <code> (list (list 'reg env-reg))) args))
+       (define! env-store (lookup code 'reg)
+         (combine (if env (lookup env-store env-reg) env) vau0 args))
+       code))
 
 (define reify
     (lambda (value)
@@ -383,7 +394,7 @@
       (define args (map reify args))
       (define reg next-reg)
       (inc! next-reg 1)
-      (push! code-list (list* 'ins reg ins args))
+      (push! code-list (list* ins reg args))
       (vecenv <code> (list (list 'reg reg)))))
 
 (define lookup-maybe
@@ -415,7 +426,11 @@
          (pcombine env (unwrap op)
                    (map (lambda (arg) (peval env arg)) args)))
         ((eq? (tag op) 'object)
-         (combine env (lookup op 'compile) (cons op args)))
+         (define effective-op
+             (if (is? op <code>)
+                 (lookup-maybe env-store (lookup op 'reg) op)
+                 op))
+         (combine env (lookup effective-op 'compile) (cons effective-op args)))
         (t (emit-ins! 'error)))))
 
 (define compile
@@ -434,7 +449,14 @@
                                           (lookup f 'expand)
                                           (cons f (vecenv <code> (list (list 'reg 2))))))))
                   (define! f 'compile saved-compile)
-                  (list* 'cvau 'env 'args body))))
+                  (combine nil cvau (print body)))))
+
+(map (lambda (applicative)
+       (print (unwrap applicative))
+       (install-code! (unwrap applicative)
+                      (compile (unwrap applicative))))
+     (list list cadr cddr caddr cdddr apply tag? cons? symbol? null? list* match-arglist
+           cata foldr foldl reverse map is?))
 
 #+nil (define match-arglist1
     (wrap (vau0 _ args
