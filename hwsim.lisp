@@ -32,6 +32,15 @@
                                      :initial-contents (mapcar #'car list))
                        (mapcar #'cadr list)))))
 
+(defun hashenv (parent list)
+  (let ((table (make-hash-table :test 'equalp)))
+    (mapc (lambda (binding)
+            (setf (gethash (car binding) table) (cadr binding)))
+          list)
+    (make-array 3 :fill-pointer 3 :adjustable t
+                  :initial-contents
+                  (list 'hashenv parent table))))
+
 (defvar <closure> (vecenv nil nil))
 (defvar <primitive> (vecenv nil nil))
 
@@ -42,7 +51,11 @@
        ((vecenv)
         (let ((p (position x (keyvec env) :test 'equal)))
           (if p (value env p)
-              (lookup (parent env) x))))))))
+              (lookup (parent env) x))))
+       ((hashenv)
+        (multiple-value-bind (value boundp)
+            (gethash x (aref env 2))
+          (if boundp value (lookup (parent env) x))))))))
 
 (defun bound? (env x)
   (ignore-errors (lookup env x) t))
@@ -57,7 +70,9 @@
               (progn
                 (vector-push-extend x (keyvec env))
                 (vector-push-extend y env)
-                y))))))))
+                y))))
+       ((hashenv)
+        (setf (gethash x (aref env 2)) y))))))
 
 (defun mutate! (env x y)
   (ecase (tag env)
@@ -66,7 +81,11 @@
        ((vecenv)
         (let ((p (position x (keyvec env) :test 'equal)))
           (if p (setf (value env p) y)
-              (mutate! (parent env) x y))))))))
+              (mutate! (parent env) x y))))
+       ((hashenv)
+        (if (nth-value 1 (gethash x (aref env 2)))
+            (setf (gethash x (aref env 2)) y)
+            (mutate! (parent env) x y)))))))
 
 (defun eval (env form)
   (case (tag form)
@@ -83,7 +102,8 @@
      (funcall (value op 0) op env args))))
 
 (defun vau (lexenv args)
-  (assert (null (cdddr args)))
+  (assert (cddr args))
+  (assert (not (cdddr args)))
   (vecenv <closure>
           (list
            (list 'code
@@ -99,40 +119,15 @@
            (list 'args-formal (cadr args))
            (list 'expr (caddr args)))))
 
-(defun adjust-env (lexenv dest)
-  (unless (< dest (length (keyvec lexenv)))
-    (let ((length (* 16 (ceiling (+ 1 dest) 16))))
-      (adjust-array lexenv (+ length 3) :fill-pointer (+ dest 4))
-      (adjust-array (keyvec lexenv) length :fill-pointer (+ dest 1)))))
-
-(defun ins (lexenv args)
-  (let ((dest (car args))
-        (op (cadr args))
-        (regs (cddr args)))
-    (adjust-env lexenv dest)
-    (setf (aref (keyvec lexenv) dest) nil)
-    (setf (value lexenv dest)
-          (apply op (mapcar (lambda (reg) (value lexenv reg)) regs)))))
-
-(defun lit (lexenv args)
-  (let ((dest (car args))
-        (value (cadr args)))
-    (adjust-env lexenv dest)
-    (setf (aref (keyvec lexenv) dest) nil)
-    (setf (value lexenv dest) value)))
-
-(defun reg (lexenv args)
-  (let ((reg (car args)))
-    (value lexenv reg)))
-
 (defun cvau (lexenv args)
   (declare (ignore lexenv))
   (let ((reg-symbols (make-hash-table))
         (fenv (car args))
         (farg (cadr args))
         (body (cddr args)))
-    (setf (gethash 0 reg-symbols) fenv
-          (gethash 1 reg-symbols) farg)
+    (setf (gethash 0 reg-symbols) '%self
+          (gethash 1 reg-symbols) fenv
+          (gethash 2 reg-symbols) farg)
     (labels ((reg-symbol (n)
                (or (gethash n reg-symbols)
                    (setf (gethash n reg-symbols) (make-symbol (format nil "R~A" n)))))
@@ -162,7 +157,7 @@
                (ecase (car form)
                  ((begin) (process (cdr form))))))
       (vecenv <closure>
-              (list (list 'code (compile nil `(lambda (self ,fenv ,farg) ,(process body)))))))))
+              (list (list 'code (compile nil `(lambda (%self ,fenv ,farg) ,(process body)))))))))
 
 (defun make-primop (f)
   (let ((lambda-name (intern (format nil "%~A" (symbol-name f)))))
@@ -199,7 +194,7 @@
 
 (defun boot ()
   (let ((env
-          (vecenv nil `((vau0 ,(make-primop 'vau))
+          (hashenv nil `((vau0 ,(make-primop 'vau))
                         (cvau ,(make-primop 'cvau))
                         #+nil (ins ,#'ins) #+nil (lit ,#'lit)
                         (<closure> ,<closure>)
@@ -209,7 +204,7 @@
                         ,@ (mapcar (lambda (symbol) `(,symbol ,(make-primapp symbol)))
                                    '(eval combine define! mutate!
                                      tag cons car cdr wrap unwrap > = < + - * /
-                                     vecenv print break lookup bound? error))
+                                     vecenv hashenv print break lookup bound? error))
                         (parent ,(make-primapp 'fexpr-parent))
                         (time ,(make-primop 'fexpr-time))
                         (inspect ,(make-primapp 'fexpr-inspect))
