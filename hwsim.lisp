@@ -33,7 +33,7 @@
                        (mapcar #'cadr list)))))
 
 (defun hashenv (parent list)
-  (let ((table (make-hash-table :test 'equalp)))
+  (let ((table (make-hash-table :test 'equal)))
     (mapc (lambda (binding)
             (setf (gethash (car binding) table) (cadr binding)))
           list)
@@ -44,21 +44,39 @@
 (defvar <closure> (vecenv nil nil))
 (defvar <primitive> (vecenv nil nil))
 
+(defun lookup-default (env x default)
+  (let ((value (lookup-local env x default)))
+    (if (eq value default)
+        (if env (lookup-default (parent env) x default) default)
+        value)))
+
 (defun lookup (env x)
+  (let ((value (lookup-default env x '%%unbound)))
+    (if (eq value '%%unbound)
+        (error "Unbound key ~A." x)
+        value)))
+
+(defun lookup-local (env x default)
   (ecase (tag env)
     ((object)
      (ecase (id env)
        ((vecenv)
         (let ((p (position x (keyvec env) :test 'equal)))
-          (if p (value env p)
-              (lookup (parent env) x))))
+          (if p (value env p) default)))
        ((hashenv)
         (multiple-value-bind (value boundp)
             (gethash x (aref env 2))
-          (if boundp value (lookup (parent env) x))))))))
+          (if boundp value default)))))
+    ((null) default)))
 
-(defun bound? (env x)
-  (ignore-errors (lookup env x) t))
+(defun keys (env)
+  (ecase (tag env)
+    ((object)
+     (ecase (id env)
+       ((vecenv) (map 'list #'identity (keyvec env)))
+       ((hashenv)
+        (loop for k being each hash-key of (aref env 2)
+              collect k))))))
 
 (defun define! (env x y)
   (ecase (tag env)
@@ -128,33 +146,44 @@
     (labels ((reg-symbol (n)
                (or (gethash n reg-symbols)
                    (setf (gethash n reg-symbols) (make-symbol (format nil "R~A" n)))))
+             (process-form (form)
+               (let ((dest (cadr form))
+                     (rest (cddr form)))
+                 `(,(reg-symbol dest)
+                   ,(case (car form)
+                      ((lit)
+                       `',(car rest))
+                      ((branch)
+                       (let ((test (car rest))
+                             (then (cadr rest))
+                             (else (caddr rest)))
+                         `(if ,(reg-symbol test)
+                              ,(process-begin then)
+                              ,(process-begin else))))
+                      ((cvau)
+                       `(vecenv <closure>
+                                (list (list 'code
+                                            (lambda (%self %env %args)
+                                              ,(process (cdr rest))))
+                                      (list 'env ,(reg-symbol (car rest))))))
+                      (t
+                       `(,(car form) ,@(mapcar #'reg-symbol rest)))))))
              (process (body)
-               `(let* ,(mapcar
-                        (lambda (form)
-                          (let ((dest (cadr form))
-                                (rest (cddr form)))
-                            `(,(reg-symbol dest)
-                              ,(case (car form)
-                                 ((lit)
-                                  `',(car rest))
-                                 ((branch)
-                                  (let ((test (car rest))
-                                        (then (cadr rest))
-                                        (else (caddr rest)))
-                                    `(if ,(reg-symbol test)
-                                         ,(process-begin then)
-                                         ,(process-begin else))))
-                                 (t
-                                  `(,(car form) ,@(mapcar #'reg-symbol rest)))))))
-                        (butlast body))
-                  ,(let ((form (car (last body))))
-                     (ecase (car form)
-                       ((reg) (reg-symbol (cadr form)))))))
+               (let ((bindings (mapcar #'process-form (butlast body)))
+                     (tail
+                       (let ((form (car (last body))))
+                         (ecase (car form)
+                           ((reg) (reg-symbol (cadr form)))))))
+                 (if (eq tail (caar (last bindings)))
+                     `(let* ,(butlast bindings) ,(cadar (last bindings)))
+                     `(let* ,bindings ,tail))))
              (process-begin (form)
                (ecase (car form)
                  ((begin) (process (cdr form))))))
-      (vecenv <closure>
-              (list (list 'code (compile nil `(lambda (%self %env %args) ,(process args)))))))))
+      (let ((sb-ext:*muffled-warnings* 'sb-int:simple-style-warning))
+          (vecenv <closure>
+               (list (list 'code (compile nil `(lambda (%self %env %args)
+                                                 ,(process args))))))))))
 
 (defun install-code! (vau cvau)
   (setf (value vau 0) (value cvau 0))
@@ -183,11 +212,10 @@
   (if (eval env (car args))
       (eval env (cadr args))
       (eval env (caddr args))))
-
 (defun %time (env args)
   (time (eval env (car args))))
-
 (defun %parent (x) (parent x))
+(defun %id (x) (id x))
 
 (defvar *inspecting-object* nil)
 
@@ -205,9 +233,11 @@
                         ,@ (mapcar (lambda (symbol) `(,symbol ,(make-primapp symbol)))
                                    '(eval combine define! mutate!
                                      tag cons car cdr wrap unwrap > = < + - * /
-                                     vecenv hashenv print break lookup bound? error
+                                     vecenv hashenv keys print break error
+                                     lookup lookup-local lookup-default
                                      install-code!))
-                        (parent ,(make-primapp '%parent))
+                         (parent ,(make-primapp '%parent))
+                         (id ,(make-primapp '%id))
                         (time ,(make-primop '%time))
                         (inspect ,(make-primapp '%inspect))
                         (nil nil)
