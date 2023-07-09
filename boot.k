@@ -599,7 +599,7 @@
 
 (define %volatile-slots '(code-list next-reg env-store value-memo))
 
-(for! (lambda (f)
+#+nil (for! (lambda (f)
         (when (eq? (tag f) 'wrap)
           (define f (unwrap f)))
         (print f)
