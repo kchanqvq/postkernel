@@ -1,25 +1,32 @@
 ;; -*- mode: Lisp-*-
-(define! ((vau0 e _ e)) ((vau0 _ x x) . define)
+(define! ((vau0 e _ e)) ((vau0 _ x (car x)) define)
   (vau0 e args (define! e (car args) (eval e (car (cdr args))))))
 (define vau vau0)
 (define the-environment (vau0 e _ e))
+(define wrap (record <wrap> (vau _ args (record <wrap> (car args)))))
+(define unwrap (wrap (vau _ args (record-field (car args) 0))))
 (define lambda
     (vau env args
          (wrap (eval env (cons vau (cons _ args))))))
 (define list (lambda x x))
 (define quote (vau _ x (car x)))
+(define caar (lambda args (car (car (car args)))))
 (define cadr (lambda args (car (cdr (car args)))))
 (define cddr (lambda args (cdr (cdr (car args)))))
+(define cdar (lambda args (cdr (car (car args)))))
 (define caddr (lambda args (car (cddr (car args)))))
+(define cadar (lambda args (car (cdar (car args)))))
 (define cdddr (lambda args (cdr (cddr (car args)))))
+(define cddar (lambda args (cdr (cdar (car args)))))
 (define apply (wrap (vau env args (combine env (unwrap (car args)) (cadr args)))))
-
 (define tag? (lambda x (eq? (tag (car x)) (cadr x))))
 (define cons? (lambda x (eq? (tag (car x)) 'cons)))
 (define symbol? (lambda x (eq? (tag (car x)) 'symbol)))
 (define null? (lambda x (eq? (tag (car x)) 'null)))
 
 (define list* (lambda x (if (cons? (cdr x)) (cons (car x) (apply list* (cdr x))) (car x))))
+
+(define signal panic)
 
 (define match-arglist
     (lambda args
@@ -30,14 +37,21 @@
                     (match-arglist (cdr (car args)) (cdr (cadr args)))))
           (if (symbol? (car args))
               (list args)
-              nil))))
+              (if (eq? (car args) _)
+                  nil
+                  (if (eq? (car args) (cadr args)) nil
+                      (signal '(arglist-mismatch))))))))
 
 ;; Arglist pattern matching
 (define vau1
     (vau0 env0 args0
-         (vau0 env args
-               (eval (vecenv env0 (match-arglist (cons (car args0) (cadr args0)) (cons env args)))
-                     (caddr args0)))))
+          (if (eq? (car args0) _)
+              (vau0 _ args
+                    (eval (vecenv env0 (match-arglist (cadr args0) args))
+                          (caddr args0)))
+              (vau0 env args
+                    (eval (vecenv env0 (match-arglist (cons (car args0) (cadr args0)) (cons env args)))
+                          (caddr args0))))))
 (define vau vau1)
 
 (define cata
@@ -72,6 +86,13 @@
        (foldl (lambda (rest el) (cons (f el) rest))
               nil a-list) )))
 
+(define filter
+    (lambda (f a-list)
+      (reverse
+       (foldl (lambda (rest el)
+                (if (f el) (cons el rest) rest))
+              nil a-list) )))
+
 (define for!
     (lambda (f a-list)
       (foldl (lambda (_ el) (f el) nil)
@@ -99,17 +120,6 @@
 
 (define vau vau2)
 
-(define compile-print (lambda (x) x))
-
-(define let
-    (vau env (bindings . body)
-         (combine (vecenv env
-                          (map (lambda (binding)
-                                 (list (car binding)
-                                       (eval env (cadr binding))))
-                               bindings))
-                  begin body)))
-
 (define cond
     (vau env clauses
          (define aux
@@ -133,22 +143,43 @@
 
 (define not (lambda (x) (if x nil t)))
 
+(define case-vau
+    (vau lexenv clauses
+         (vau dynenv args
+              (define aux
+                  (lambda (clauses)
+                    (if clauses
+                        (begin
+                         (define match
+                             (call-with-condition-handler
+                              (lambda (c) 'fail)
+                              (lambda ()
+                                (match-arglist (cons (caar clauses) (cadar clauses))
+                                               (cons dynenv args)))))
+                         (if (eq? match 'fail)
+                             (aux (cdr clauses))
+                             (combine (vecenv lexenv match)
+                                      begin (cddar clauses))))
+                        (signal '(arglist-mismatch)))))
+              (aux clauses))))
+
 (define and
     (vau0 env args
-         (if (cons? args)
-             (let ((head (eval env (car args))))
+          (if (cons? args)
+              (begin
+               (define head (eval env (car args)))
                (when head
                  (if (cons? (cdr args))
                      (combine env and (cdr args))
                      head)))
-             t)))
-
+              t)))
 (define or
-    (vau env args
-         (if (cons? args)
-             (let ((head (eval env (car args))))
+    (vau0 env args
+          (if (cons? args)
+              (begin
+               (define head (eval env (car args)))
                (if head head (combine env or (cdr args))))
-             nil)))
+              nil)))
 
 (define any?
     (lambda (pred ys)
@@ -191,6 +222,8 @@
                          (reg 2)))
                 (reg 5))))
 
+;;; Setters
+
 (define set!
     (vau env (place value)
          (mutate! env place (eval env value))))
@@ -207,63 +240,175 @@
           env place
           (+ (eval env value) (lookup env place)))))
 
-(define install-bindings!
-    (lambda (env bindings)
-      (for! (lambda (binding)
-              (mutate! env (car binding) (cadr binding)))
-            bindings)))
+;;; Continuations
 
-(define fluid-let!
+(define record?
+    (lambda (object a-record-descriptor)
+      (and (eq? (tag object) 'record)
+           (eq? (record-descriptor object) a-record-descriptor))))
+
+(define lookup-maybe
+    (vau dynenv (env x default-expr)
+         (define slot (list (lookup-slot (eval dynenv env) (eval dynenv x) '%unbound)))
+         (if (eq? (car slot) '%unbound)
+             (eval dynenv default-expr)
+             (if (lookup-hook? (car slot))
+                 (combine dynenv (lookup-hook-operative (car slot)) (list x))
+                 (car slot)))))
+
+(define lookup-slot
+    (lambda (env x default)
+      (if env
+          (begin
+           (define slot (list (lookup-local env x default)))
+           (if (eq? (car slot) default)
+               (lookup-slot (parent env) x default)
+               (car slot)))
+          default)))
+
+(define primitive-call/cc call/cc)
+(define primitive-invoke-continuation! invoke-continuation!)
+(define *fluid-env* (vecenv nil nil))
+(define call/cc
+    (lambda (thunk)
+      (primitive-call/cc
+       (lambda (k)
+         (define! k 'fluid-env *fluid-env*)
+         (thunk k)))))
+(define invoke-continuation!
+    (lambda (cont value)
+      (set! *fluid-env* (lookup cont 'fluid-env))
+      (primitive-invoke-continuation! cont value)))
+
+(define <fluid>
+    (vau env (x)
+         (define self (lookup-hook-operative (lookup-local env x nil)))
+         (lookup-maybe *fluid-env* self (lookup self 'default-value))))
+
+(define! <fluid> 'setter
+  (vau env (x new-value)
+       (define self (lookup-hook-operative (lookup-local env x nil)))
+       (mutate! *fluid-env* self new-value)))
+
+(define define-fluid
+    (vau env (var . default-value-expr)
+         (define! env var
+           (record <lookup-hook>
+                   (if default-value-expr
+                       (vecenv <fluid> (list (list 'default-value (eval env (car default-value-expr)))))
+                       (vecenv <fluid> (list (list 'name var))))))))
+
+(define call-with-fluids
+    (lambda (bindings thunk)
+      (define saved-state *fluid-env*)
+      (set! *fluid-env* (vecenv *fluid-env* bindings))
+      (define result (thunk))
+      (set! *fluid-env* saved-state)
+      result))
+
+(define with-fluids
     (vau env (bindings . body)
-         (define saved-bindings
-             (map (lambda (binding)
-                    (list (car binding) (lookup env (car binding))))
-                  bindings))
-         (define new-bindings
-             (map (lambda (binding)
-                    (list (car binding) (eval env (cadr binding))))
-                  bindings))
-         (install-bindings! env new-bindings)
-         (define result (combine env begin body))
-         (install-bindings! env saved-bindings)
-         result))
+         (call-with-fluids
+          (map (lambda (binding)
+                 (list (lookup-hook-operative (lookup-slot env (car binding) nil))
+                       (eval env (cadr binding))))
+               bindings)
+          (lambda () (eval env (cons begin body))))))
 
+(define let/cc
+    (vau env (var . body)
+         (call/cc (eval env (list* lambda (list var) body)))))
 
-(define <code> (vecenv nil nil))
+(define catch
+    (vau env (var . body)
+         (call/cc
+          (lambda (k)
+            (call-with-fluids
+             (list (list (lookup-hook-operative (lookup-slot env var nil)) k))
+             (lambda () (combine env begin body)))))))
+
+(define-fluid error-continuation
+   (let/cc return
+           (panic (let/cc k
+                          (invoke-continuation! return k)))))
+(define signal
+    (lambda (condition)
+      (let/cc k (invoke-continuation! error-continuation (cons k condition)))))
+
+(define call-with-condition-handler
+    (lambda (handler thunk)
+      (let/cc normal-k
+              (handler
+               (let/cc abnormal-k
+                       (with-fluids ((error-continuation abnormal-k))
+                         (invoke-continuation! normal-k (thunk))))))))
+(define ignore-errors
+    (vau env body
+         (call-with-condition-handler
+          (lambda (c))
+          (lambda () (combine env begin body)))))
+
+;;; Partial evaluator
+
+(define <code> (vecenv nil (list (list 'length 1))))
 (define code?
     (lambda (object)
-      (and (eq? (tag object) 'object)
-           (eq? (parent object) <code>))))
+      (and (record? object <code>)
+           (eq? (tag (code-reg object)) 'fixnum))))
+(define code-reg
+    (lambda (object)
+      (record-field object 0)))
 
-(define code-list nil)
-(define next-reg nil)
-;; `env-store' is the store data structure for partial evaluation.
+(define dynamic-tail?
+    (lambda (list-a)
+      (if (cons? list-a)
+          (dynamic-tail? (cdr list-a))
+          (code? list-a))))
 
-;; Consider in dynamic semantics, Env: Var -> (Env + OtherVal...)  To
-;; make it mutable, factor it into Env: Var -> Loc, Store: Loc -> (Env
-;; + OtherVal...)  Now let Loc = Reg and we have Env: Var -> Reg,
-;; Store: Reg -> (Env + OtherVal...)
+(define list-dynamic?
+    (lambda (list-a)
+      (if (cons? list-a)
+          (or (code? (car list-a))
+              (list-dynamic? (cdr list-a)))
+          (code? list-a))))
 
-;; This is almost what we use for PEval time environments and
-;; `env-store', except that we don't allocate Reg for every
-;; environment, i.e. actually Loc = Reg + StaticLoc.  The environments
-;; that are not (yet) side-effected by PEval-ed code are not assigned
-;; Reg. They are represented by themselves directly, i.e.  Env : Var
-;; -> (Reg + StaticEnv), Store: Reg -> (Env + OtherVal...).  Note that
-;; some StaticEnv in Env objects may later be assigned a Reg and
-;; side-effected upon. These StaticEnv occurrences are not
-;; automatically back-patched, so always normalize a PEval time
-;; environment (something like (lookup env-store (reify env))) to get
-;; the update-to-date PEval time state.
-(define env-store nil)
-(define value-memo nil)
+(define list-n-dynamic?
+    (lambda (list-a n)
+      (if (cons? list-a)
+          (if (= n 0)
+              (code? (car list-a))
+              (list-n-dynamic? (cdr list-a) (- n 1)))
+          (code? list-a))))
+
+(define-fluid code-list)
+(define-fluid next-reg)
+;; `hashenv' of all paartial static environments
+(define-fluid psenv-table (vecenv nil nil))
+(define-fluid value-memo)
+(define-fluid reg-info-value)
+(define-fluid reg-info-effect)
+(define-fluid dead-branch-continuation)
 
 (define! <primitive> 'residualize
   (vau env (op . args)
-       (apply emit-ins! (cons (lookup op 'name) args))))
+       (define result
+           (if (dynamic-tail? args)
+               (emit-ins! 'combine nil op args)
+               (apply emit-ins! (cons (lookup op 'name) args))))
+       (define! reg-info-effect (code-reg result) (lookup op 'effect))
+       result))
 (define! <closure> 'residualize
   (vau env (op . args)
-       (emit-ins! 'combine env op args)))
+       (define result (emit-ins! 'combine
+                                 (if (eq? (lookup op 'env-formal) _) nil env)
+                                 op args))
+       (define effect (lookup op 'effect))
+       (define! reg-info-effect (code-reg result) effect)
+       (when effect
+         (psenv-invalidate! args)
+         (unless (eq? (lookup op 'env-formal) _)
+           (psenv-invalidate! env)))
+       result))
 
 (define! <primitive> 'expand
   (vau env (op . args) (combine env op args)))
@@ -280,120 +425,183 @@
            (list (lookup op 'args-formal) args))))
         (lookup op 'expr))))
 
-(define expand-always
-    (vau env (op . args)
-         (combine env (lookup op 'expand) (cons op args))))
-
-(define residualize-always
-    (vau env (op . args)
-         (combine env (lookup op 'residualize) (cons op args))))
-
-(define expand-when-arglist
-    (vau env (op . args)
-         (combine env
-                  (if (code? args)
-                      (lookup op 'residualize)
-                      (lookup op 'expand))
-                  (cons op args))))
-
-(define expand-when-static
-    (vau env (op . args)
-         (combine env
-                  (if (or (code? args)
-                          (any? (lambda (arg) (code? arg)) args))
-                      (lookup op 'residualize)
-                      (lookup op 'expand))
-                  (cons op args))))
-
-(define expand-when-nth-static
-    (lambda (n)
+(define residualize-when
+    (lambda (f)
       (vau env (op . args)
            (combine env
-                    (if (or (code? args)
-                            (code? (nth args n)))
+                    (if (f args)
                         (lookup op 'residualize)
                         (lookup op 'expand))
                     (cons op args)))))
 
-(define! <code> 'compile
-  (vau env (op . args)
-       (emit-ins! 'combine env op args)))
-(define! <primitive> 'compile residualize-always)
-(define! <closure> 'compile expand-when-static)
-
-(define! quote 'compile expand-when-arglist)
-(define! (unwrap list*) 'compile expand-always)
+(define! <primitive> 'compile (residualize-when (lambda _ t)))
+(define! <closure> 'compile (residualize-when list-dynamic?))
 
 (for! (lambda (applicative)
-        (define! (unwrap applicative) 'compile expand-when-arglist))
-      (list cons wrap
-            list cadr cddr caddr apply tag? cons? symbol? null?
-            not install-bindings!))
+        (define! (unwrap applicative) 'compile (residualize-when code?)))
+      (list cons record wrap unwrap
+            list list* cadr cddr caddr apply tag? cons? symbol? null? not
+            code? code-reg))
 
-(define! (unwrap match-arglist) 'compile (expand-when-nth-static 0))
+(define! (unwrap match-arglist) 'compile
+  (residualize-when (lambda (args) (list-n-dynamic? args 0))))
 
 (for! (lambda (primitive-app)
-        (define! (unwrap primitive-app) 'compile expand-when-static))
-      (list car cdr unwrap tag eq?))
+        (define! (unwrap primitive-app) 'compile (residualize-when list-dynamic?)))
+      (list car cdr record-descriptor record-field tag eq?))
 
 (define! if 'compile
   (vau env (_ test then else)
        (define test (peval env test))
        (cond ((code? test)
               (define reg next-reg)
+              (define then-value '%dead-branch)
+              (define else-value '%dead-branch)
+              (define reg-info-effect reg t) ;; TODO: less naive effect analysis
               (inc! next-reg 1)
               (push! code-list
                      (list 'branch reg (reify test)
-                           ;; TODO: handle `env-store' merge correctly
-                           (fluid-let! ((next-reg next-reg)
-                                        (code-list nil)
-                                        (value-memo (hashenv value-memo nil)))
-                                       (cons 'begin (collect-code-list (reify (peval env then)))))
-                           (fluid-let! ((next-reg next-reg)
-                                        (code-list nil)
-                                        (value-memo (hashenv value-memo nil)))
-                                       (cons 'begin (collect-code-list (reify (peval env else)))))))
-              (vecenv <code> (list (list 'reg reg))))
+                           ;; TODO: handle partial static environment store merge correctly
+                           (with-fluids
+                            ((code-list nil)
+                             (value-memo (hashenv value-memo nil)))
+                            (cons 'begin
+                                  (collect-code-list
+                                   (catch dead-branch-continuation
+                                     (reify (set! then-value (peval env then)))))))
+                           (with-fluids
+                            ((code-list nil)
+                             (value-memo (hashenv value-memo nil)))
+                             (cons 'begin
+                                  (collect-code-list
+                                   (catch dead-branch-continuation
+                                     (reify (set! else-value (peval env else)))))))))
+              (if (code? then-value)
+                  (record <code> reg)
+                  (if (code? else-value)
+                      (record <code> reg)
+                      (if (eq? then-value '%dead-branch)
+                          (if (eq? else-value '%dead-branch)
+                              (invoke-continuation! dead-branch-continuation reg)
+                              else-value)
+                          (if (eq? else-value '%dead-branch)
+                              then-value
+                              (if (eq? then-value else-value)
+                                  then-value
+                                  (record <code> reg)))))))
              (test (peval env then))
              (t (peval env else)))))
+
+(define! (unwrap primitive-call/cc) 'residualize
+  (vau _ (_ thunk)
+       (psenv-invalidate! thunk)
+       (emit-ins! 'call/cc thunk)))
+
+(define! (unwrap primitive-invoke-continuation!) 'residualize
+  (vau _ (_ cont value)
+       (invoke-continuation! dead-branch-continuation
+                             (reify (emit-ins! 'invoke-continuation! cont value)))))
+
+(define! (unwrap signal) 'residualize
+  (vau _ (op . args)
+       (invoke-continuation! dead-branch-continuation
+                             (reify (emit-ins! 'combine nil op args)))))
+(define! (unwrap signal) 'compile (residualize-when (lambda _ t)))
 
 (define! begin2 'compile
   (vau env (_ first second)
        (peval env first)
        (peval env second)))
-(define! (unwrap compile-print) 'compile
-  (vau env (_ x) (print code-list) (print x) x))
 (define! (unwrap eval) 'compile (vau _ (_ env form) (peval env form)))
 (define! (unwrap combine) 'compile  (vau _ (_ env op args) (pcombine env op args)))
 
-(define! (unwrap vecenv) 'compile
+(define! (unwrap vecenv) 'compile (residualize-when list-dynamic?))
+(define! (unwrap vecenv) 'expand
   (vau _ (_ parent alist)
-       (define code (emit-ins! 'vecenv parent alist))
-       (if (code? alist) code
-           (begin
-            (define result (vecenv parent alist))
-            (define! value-memo result (reify code))
-            (define! env-store result (vecenv nil (list (list 'dynamic? t))))
-            result))))
+       (define result (vecenv parent alist))
+       (define reg (code-reg (emit-ins! 'vecenv parent alist)))
+       (define! psenv-table result t)
+       (define! value-memo result reg)
+       result))
 
 (define! (unwrap define!) 'compile
   (vau _ (_ env key value)
-       (emit-ins! 'define! env key value)
-       (unless (bound? env-store env)
-         (define! env-store env (vecenv nil nil)))
-       (define! (lookup env-store env) key value)))
-;; TODO: call compile recursively
-;; The following do not compile nested vau, i.e. closures are
-;; interpreted for now.  Our `compile' will look for remaining
-;; closures after dead-code elimination and compile them recursively,
+       (define reg (code-reg (emit-ins! 'define! env key value)))
+       (unless (bound? psenv-table env)
+         (define! reg-info-effect reg t))
+       (when (eq? (tag env) 'object)
+         (if (bound? psenv-table env)
+             (define! env key value)
+             (unless (member? (lookup-maybe env '%volatile-slots nil) key)
+               (signal (list 'non-volatile-slot-write env key)))))
+       value))
+
+(define! (unwrap mutate!) 'compile
+  (vau _ (_ env key value)
+       ;; TODO: This is probably too aggressive and wrong.
+       ;; Make it conservative and correct.
+       (define reg (code-reg (emit-ins! 'mutate! env key value)))
+       (define! reg-info-effect reg t)
+       (define process!
+           (lambda (env)
+             (when (bound? psenv-table env)
+               (if (bound? env key)
+                   (define! env key value)
+                   (process! (parent env))))))
+       (process! env)))
+
+;; The following do not compile nested `vau', i.e. closures are
+;; interpreted for now.  `reify' will compile `vau's when it sees one,
 ;; so we don't bother compiling `vau's that are only used during
 ;; expansion.
-(define! vau0 'compile
+(define! vau0 'expand
   (vau env (_ . args)
        (define result (combine env vau0 args))
-       (define! value-memo result (reify (emit-ins! 'vau env args)))
-       (annotate-ins! env args)
+       (define reg (code-reg (emit-ins! 'vau env args)))
+       (define! psenv-table result t)
+       (define! value-memo result reg)
+       (define! reg-info-value reg result)
        result))
+(define! vau0 'compile (residualize-when list-dynamic?))
+
+(define compile-print (lambda (x) x))
+(define! (unwrap compile-print) 'compile
+  (vau env (_ x) (print x) x))
+
+(define record-fields
+    (lambda (r)
+      (define loop
+          (lambda (i)
+            (if (< i (lookup (record-descriptor r) 'length))
+                (cons (record-field r i) (loop (+ i 1)))
+                nil)))
+      (loop 0)))
+
+(define nub
+    (lambda (a-list)
+      (define mark-table (hashenv nil nil))
+      (reverse
+       (foldl (lambda (rest el)
+                (if (bound? mark-table el)
+                    rest
+                    (begin
+                     (define! mark-table el t)
+                     (cons el rest))))
+              nil a-list))))
+
+(define remove
+    (lambda (a-list el)
+      (filter (lambda (a-el) (not (eq? a-el el))) a-list)))
+
+(define member?
+    (lambda (a-list el)
+      (any? (lambda (a-el) (eq? a-el el)) a-list)))
+
+(define all-keys
+    (lambda (env)
+      (when env
+        (append (keys env)
+                (all-keys (parent env))))))
 
 (define reify
     (lambda (value)
@@ -402,20 +610,19 @@
        (define! value-memo value
          (cond
            ((cons? value)
-            (reify (emit-ins! 'cons (car value) (cdr value))))
-           ((eq? (tag value) 'wrap)
-            (reify (emit-ins! 'wrap (unwrap value))))
+            (define reg (code-reg (emit-ins! 'cons (car value) (cdr value))))
+            reg)
            ((code? value)
-            (lookup value 'reg))
+            (code-reg value))
+           ((eq? (tag value) 'record)
+            (define reg (code-reg (apply emit-ins! (list* 'record (record-descriptor value) (record-fields value)))))
+            reg)
            (t
+            (when (bound? psenv-table value)
+              (signal (list 'broken-invariant value)))
             (define reg next-reg)
             (inc! next-reg 1)
             (push! code-list (list 'lit reg value))
-            (when (eq? (tag value) 'object)
-              (define! env-store value
-                (vecenv nil
-                        (map (lambda (slot) (list slot '%unknown))
-                             (lookup-maybe value '%volatile-slots nil)))))
             reg))))))
 
 (define emit-ins!
@@ -424,36 +631,27 @@
       (define reg next-reg)
       (inc! next-reg 1)
       (push! code-list (list* ins reg args))
-      (vecenv <code> (list (list 'reg reg)))))
-
-(define annotate-ins!
-    (lambda annotations
-      (set! code-list (cons (append (car code-list) annotations)
-                            (cdr code-list)))))
-
-(define lookup-maybe
-    (vau dynenv (env x default)
-         (define result (lookup-default (eval dynenv env) (eval dynenv x) '%unbound))
-         (if (eq? result '%unbound) (eval dynenv default) result)))
+      (record <code> reg)))
 
 (define bound?
     (lambda (env key)
-      (not (eq? (lookup-default env key '%unbound) '%unbound))))
+      (not (eq? (lookup-slot env key '%unbound) '%unbound))))
 
 (define plookup
     (lambda (env key)
-      (when env
-        (define store-info (lookup-maybe env-store env nil))
-        (define store-value (lookup-local store-info key '%unbound))
-        (if (eq? store-value '%unbound)
-            (begin
-             (define value (lookup-local env key '%unbound))
-             (if (eq? value '%unbound)
-                 (plookup (parent env) key)
-                 value))
-            (if (eq? store-value '%unknown)
-                (emit-ins! 'lookup env key)
-                store-value)))))
+      (if env
+          (if (code? env)
+              (emit-ins! 'lookup env key)
+              (begin
+               (define slot (list (lookup-local env key '%unbound)))
+               (cond ((or (eq? (car slot) '%unknown)
+                          (member? (lookup-local env '%volatile-slots nil) key))
+                      (emit-ins! 'lookup env key))
+                     ((eq? (car slot) '%unbound) (plookup (parent env) key))
+                     ((lookup-hook? (car slot))
+                      (pcombine env (lookup-hook-operative (car slot)) (list key)))
+                     (t (car slot)))))
+          (emit-ins! 'vm-error (list 'unbound-key env key)))))
 
 (define peval
     (lambda (env form)
@@ -465,71 +663,103 @@
 (define pcombine
     (lambda (env op args)
       (cond
-        ((eq? (tag op) 'wrap)
+        ((record? op <wrap>)
          (pcombine env (unwrap op)
                    (map (lambda (arg) (peval env arg)) args)))
+        ((code? op)
+         (define result (emit-ins! 'combine env op args))
+         (define! reg-info-effect (code-reg result) t)
+         result)
         ((eq? (tag op) 'object)
-         ;; TODO: handle `env-store'
+         ;; TODO: handle partial static environment
          (combine env (lookup op 'compile) (cons op args)))
-        (t (emit-ins! 'error)))))
+        (t (emit-ins! 'vm-error (list 'unapplicable op))))))
 
-(define all-keys
-    (lambda envs
-      (define table (hashenv nil nil))
+(define clone
+    (lambda (env)
+      (vecenv (parent env)
+              (map (lambda (key) (list key (lookup env key)))
+                   (keys env)))))
+
+;; TODO: handle parent link
+(define clone-into!
+    (lambda (dst src)
+      (for! (lambda (key)
+              (define! dst key (lookup src key)))
+            (keys src))))
+
+(define save-psenv
+    (lambda ()
+      (map (lambda (env)
+             (list env (clone env)))
+           (keys psenv-table))))
+
+(define restore-psenv!
+    (lambda (save-list)
+      (for! (lambda (el)
+              (apply clone-into! el))
+            save-list)))
+
+;; Create the appropriate partial static environment store and
+;; environment access code for compiling nested vau.  `pe-env' is the
+;; environment component of the closure.
+
+;; What this function does: Traverse `pe-env', for each partial static
+;; environment encountered, mask every slot containing `<code>' from
+;; compiling the outer vau with `%volatile-slots'.
+(define psenv-import!
+    (lambda (root-obj)
       (define process!
-          (lambda (env)
-            (when env
-              (for! (lambda (key) (define! table key t))
-                    (keys env))
-              (process! (parent env)))))
-      (for! process! envs)
-      (keys table)))
+          (lambda (datum access-code)
+            (cond
+              ((eq? (tag datum) 'object)
+               (when (bound? psenv-table datum)
+                 (unless (bound? value-memo datum)
+                   (define! value-memo datum (code-reg access-code))
+                   (process! (parent datum) (emit-ins! 'parent datum))
+                   (define volatile-slots nil)
+                   (for!
+                    (lambda (key)
+                           (define value (lookup-local datum key '%broken-invariant))
+                           (define! datum key
+                             (process! value (emit-ins! 'lookup-local datum key '%broken-invariant))))
+                    (keys datum))))
+               datum)
+              ((code? datum) access-code)
+              ((eq? (tag datum) 'record)
+               (define! value-memo datum (code-reg access-code))
+               (define loop
+                   (lambda (i)
+                     (when (> i -1)
+                       (cons (process! (record-field datum i)
+                                       (emit-ins! 'record-field datum i))
+                             (loop (- i 1))))))
+               (apply record (cons (record-descriptor datum)
+                                   (loop (- (lookup (record-descriptor datum) 'length) 1)))))
+              (t datum))))
+      (process! root-obj (record <code> 0))))
 
-
-;; Create the appropriate `env-store' entry and environment access
-;; code for compiling nested vau.  `pe-env' is the environment
-;; component of the closure being compiled and `old-env-store' is the
-;; `env-store' for compiling the outer vau.
-
-;; What this function does: Traverse `pe-env', for each environment
-;; encountered, create `env-store' entry inheriting from corresponding
-;; `old-env-store' and mask every slot containing `<code>' from
-;; compiling the outer vau with `%unknown'. The traversal only
-;; descends into environments with `dynamic?'=t in `old-env-store'.
-(define env-store-import!
-  (lambda (pe-env old-env-store)
-    (define process-env!
-        (vau dynenv (env-expr emit-ins-expr)
-             (define env (eval dynenv env-expr))
-             (when env
-               (define! value-memo env (reify (eval dynenv emit-ins-expr)))
-               (process-env! (parent env) (emit-ins! 'parent env))
-               (define store-info (lookup-maybe old-env-store env nil))
-               (define! env-store env
-                 (vecenv store-info
-                         (foldr (lambda (key rest)
-                                  (define value
-                                      (lookup-maybe store-info key (lookup env key)))
-                                  (if (code? value) ;; TODO: traverse value types recursively.
-                                      (begin
-                                       (define new-code (emit-ins! 'lookup env key))
-                                       (define! value-memo value (reify new-code))
-                                       (cons (list key new-code) rest))
-                                      (begin
-                                       (when (eq? (tag value) 'object)
-                                         (process-env! value (emit-ins! 'lookup env key)))
-                                       rest)))
-                                nil
-                                (if (lookup-maybe store-info 'dynamic? nil)
-                                    (all-keys store-info env)
-                                    (all-keys store-info))))))))
-    (process-env! pe-env (emit-ins! 'lookup (vecenv <code> (list (list 'reg 0))) 'env))))
+(define psenv-invalidate!
+    (lambda (datum)
+      (cond
+        ((eq? (tag datum) 'object)
+         (when (and (bound? psenv-table datum)
+                    (not (eq? (parent datum) <closure>)))
+           (for! (lambda (key)
+                   (psenv-invalidate! (lookup datum key))
+                   (define! datum key '%unknown))
+                 (keys datum))))
+        ((eq? (tag datum) 'record)
+         (for! psenv-invalidate! (record-fields datum)))
+        ((cons? datum)
+         (psenv-invalidate! (car datum))
+         (psenv-invalidate! (cdr datum))))))
 
 ;; Basically reverse `code-list' to get a instruction listing.
 ;; Perform dead-code elimination and compile remaining `vau' recursively.
 (define collect-code-list
     (lambda (root-reg)
-      (define mark-table (hashenv nil (list (list root-reg t))))
+      (define mark-table (hashenv reg-info-effect (list (list root-reg t))))
       (define mark-ins
           (lambda (ins)
             (define class (car ins))
@@ -539,81 +769,95 @@
                    (define! mark-table (car body) t)
                    (map mark-ins (cdr (cadr body)))
                    (map mark-ins (cdr (caddr body))))
-                  ((eq? class 'reg)
-                   (define! mark-table (cadr ins) t))
-                  (t (map (lambda (reg) (define! mark-table reg t)) body)))))
+                  (t (map (lambda (reg) (define! mark-table reg t)) (cdr ins))))))
+      (for! (lambda (ins)
+              (when
+                  (or (lookup-maybe mark-table (cadr ins) nil)
+                      (and (eq? (car ins) 'define!)
+                           (lookup-maybe mark-table (caddr ins) nil)))
+                (mark-ins ins)))
+            code-list)
+      (for! (lambda (ins)
+              (when
+                  (or (lookup-maybe mark-table (cadr ins) nil)
+                      (and (eq? (car ins) 'define!)
+                           (lookup-maybe mark-table (caddr ins) nil)))
+                (mark-ins ins)))
+            code-list)
+      (for! (lambda (ins)
+              (when
+                  (or (lookup-maybe mark-table (cadr ins) nil)
+                      (and (eq? (car ins) 'define!)
+                           (lookup-maybe mark-table (caddr ins) nil)))
+                (mark-ins ins)))
+            code-list)
       (define result (list (list 'reg root-reg)))
-      (define process!
-          (lambda (a-code-list)
-            (when a-code-list
-              (define ins (car a-code-list))
-              (when (or (eq? (car ins) 'combine)
-                        (eq? (car ins) 'define!)
-                        (eq? (car ins) 'mutate!)
-                        (eq? (car ins) 'branch) ;; TODO: eliminate pure `branch'
-                        (bound? mark-table (cadr ins)))
-                (mark-ins ins)
+      (for! (lambda (ins)
+              (when (lookup-maybe mark-table (cadr ins) nil)
                 (if (eq? (car ins) 'vau)
                     (begin
-                     (define annotations (cddr (cddr ins)))
-                     (define old-env-store env-store)
-                     (define compiled-body
-                         (fluid-let! ((code-list nil)
-                                      (next-reg 3)
-                                      (env-store (hashenv nil nil))
-                                      (value-memo (hashenv nil nil)))
-                                     (env-store-import! (car annotations) old-env-store)
-                                     (define f (combine (car annotations) vau0 (cadr annotations)))
-                                     (define! value-memo f 0)
-                                     (do-compile f)))
+                     (define value (lookup reg-info-value (cadr ins)))
+                     (define saved-psenv-list (save-psenv))
+                     (define compiled-body (do-compile value))
+                     (restore-psenv! saved-psenv-list)
                      (push! result
                             (list* 'cvau (cadr ins) (caddr ins)
                                    compiled-body)))
-                    (push! result ins)))
-              (process! (cdr a-code-list)))))
-      (process! code-list)
+                    (push! result ins))))
+            code-list)
       result))
 
 (define do-compile
     (lambda (f)
+      ;; Returns a list of instructions.
       (print f)
-      (define saved-compile (lookup f 'compile))
-      (define! f 'compile
-        (vau env (op . args)
-             (emit-ins! 'combine env (vecenv <code> (list (list 'reg 0))) args)))
-      (define body (collect-code-list
-                    (reify
-                     (combine (vecenv <code> (list (list 'reg 1)))
-                              (lookup f 'expand)
-                              (cons f (vecenv <code> (list (list 'reg 2))))))))
-      (define! f 'compile saved-compile)
-      (print body)))
+      (with-fluids ((code-list nil)
+                    (next-reg 3)
+                    (psenv-table (hashenv psenv-table nil))
+                    (value-memo (hashenv nil nil))
+                    (reg-info-value (hashenv nil nil))
+                    (reg-info-effect (hashenv nil nil)))
+        (psenv-import! f)
+        (define saved-compile (lookup f 'compile))
+        (define! f 'compile (residualize-when (lambda _ t)))
+        (define body (print (collect-code-list
+                             (catch dead-branch-continuation
+                               (reify
+                                (combine (record <code> 1)
+                                         (lookup f 'expand)
+                                         (cons f (record <code> 2))))))))
+        (define! f 'compile saved-compile)
+        body)))
 
 (define compile
     (lambda (f)
-      (fluid-let! ((code-list nil)
-                   (next-reg 3)
-                   (env-store (hashenv nil nil))
-                   (value-memo (hashenv nil (list (list f 0)))))
-                  (combine nil cvau (do-compile f)))))
+      (combine nil cvau (do-compile f))))
 
-(define %volatile-slots '(code-list next-reg env-store value-memo))
+(define %volatile-slots '(*fluid-env*))
 
-#+nil (for! (lambda (f)
-        (when (eq? (tag f) 'wrap)
-          (define f (unwrap f)))
-        (print f)
-        (install-code! f (compile f)))
+(define compile-install!
+    (lambda (f)
+      (when (record? f <wrap>)
+        (define f (unwrap f)))
+      (print f)
+      (install-code! f (compile f))))
+
+(for! compile-install!
       (list list cadr cddr caddr cdddr apply tag? cons? symbol? null? list* match-arglist
-            cata foldr foldl reverse append map for! bound? code?
-            reify emit-ins! plookup peval pcombine
-            #+nil collect-code-list
-            (lookup <primitive> 'expand)
-            (lookup <closure> 'expand)
-            (lookup <primitive> 'residualize)
-            (lookup <closure> 'residualize)
-            expand-always residualize-always expand-when-arglist
-            expand-when-static expand-when-nth-static))
+            lookup-slot call/cc invoke-continuation! <fluid> (lookup <fluid> 'setter) signal
+            cata foldr foldl reverse append map filter for!
+            code? dynamic-tail? list-dynamic? list-n-dynamic?
+            record-fields all-keys nub remove member? reify emit-ins! bound? clone clone-into!
+            plookup peval pcombine
+            (lookup <primitive> 'expand) (lookup <closure> 'expand)
+            (lookup <primitive> 'residualize) (lookup <closure> 'residualize)
+            residualize-when
+            #+nil (lookup if 'compile) (lookup begin2 'compile)
+            (lookup (unwrap eval) 'compile) (lookup (unwrap combine) 'compile)
+            #+nil collect-code-list #+nil psenv-import!
+            psenv-invalidate!
+            call-with-fluids))
+
 #+nil (define for-env!
     (lambda (f env)
       (define mark-table (hashenv nil nil))
@@ -639,7 +883,7 @@
      (install-code! f (compile f))))
  (the-environment))
 
-#+nil (define is?
+(define is?
     (lambda (object prototype)
       (and object (eq? (tag object) 'object)
            (or (eq? object prototype)

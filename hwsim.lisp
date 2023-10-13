@@ -250,13 +250,4 @@
         (loop
           (format t "~&PK> ")
           (print (eval env (read))))
-            (end-of-file () (format t "~%Moriturus te saluto.")))
-    #+nil (prin1 (time (eval env '(fib 10))))))
-
-(defun fib (x)
-  (cond ((> x 1) (+ (fib (- x 1)) (fib (- x 2))))
-        (t 1)))
-#+nil (reify (m/eval (vector 'closure nil (lambda (_self _cont _env arg) arg)) *env* '(vau _ (x) (let ((y x)) y))))
-#+nil (m/eval *halt* *env* `((vau1 _ (_ x) x) . ,(reflect 'x)))
-#+nil (vau1 e0 (e args . body)
-      (eval (list vau (eval (reflect e) (cons (eval e0 (list* vau1 e args body)) (reflect x))))))
+            (end-of-file () (format t "~%Moriturus te saluto.")))))
